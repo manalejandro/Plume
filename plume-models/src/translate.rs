@@ -6,8 +6,10 @@
 //! supported. `LIBRETRANSLATE_API_KEY` is optional and sent with every request
 //! when set.
 
+use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::{Error, Result, CONFIG};
 
@@ -17,6 +19,25 @@ use crate::{Error, Result, CONFIG};
 const MAX_CHUNK_CHARS: usize = 3000;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the list of languages reported by the instance is cached. The list
+/// doesn't change while Plume is running, so there is no need to ask the
+/// instance for it on every page view.
+const LANGUAGES_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// When fetching the language list fails (instance down, network error...),
+/// don't retry before this delay, to avoid hammering the instance.
+const LANGUAGES_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct LanguagesCache {
+    fetched_at: Option<Instant>,
+    languages: Vec<Language>,
+    failed_at: Option<Instant>,
+}
+
+static LANGUAGES_CACHE: Lazy<Mutex<LanguagesCache>> =
+    Lazy::new(|| Mutex::new(LanguagesCache::default()));
 
 /// A language supported by the configured instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +236,46 @@ pub fn translate_post_fields(
 }
 
 /// Returns the languages supported by the configured instance.
+///
+/// The result is cached: the instance is only queried when the cache is empty
+/// or older than [`LANGUAGES_CACHE_TTL`], so visiting the translation page
+/// doesn't hit the instance on every request.
 pub fn supported_languages() -> Result<Vec<Language>> {
+    {
+        let cache = LANGUAGES_CACHE.lock().unwrap();
+        if let Some(fetched_at) = cache.fetched_at {
+            if fetched_at.elapsed() < LANGUAGES_CACHE_TTL {
+                return Ok(cache.languages.clone());
+            }
+        }
+        if let Some(failed_at) = cache.failed_at {
+            if failed_at.elapsed() < LANGUAGES_FAILURE_BACKOFF {
+                // A refresh failed recently: don't hit the instance again yet.
+                // Keep serving the last known list when we have one.
+                if cache.languages.is_empty() {
+                    return Err(Error::Request);
+                }
+                return Ok(cache.languages.clone());
+            }
+        }
+    }
+
+    match fetch_supported_languages() {
+        Ok(languages) => {
+            let mut cache = LANGUAGES_CACHE.lock().unwrap();
+            cache.languages = languages.clone();
+            cache.fetched_at = Some(Instant::now());
+            cache.failed_at = None;
+            Ok(languages)
+        }
+        Err(err) => {
+            LANGUAGES_CACHE.lock().unwrap().failed_at = Some(Instant::now());
+            Err(err)
+        }
+    }
+}
+
+fn fetch_supported_languages() -> Result<Vec<Language>> {
     let (url, api_key) = endpoint("languages")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
